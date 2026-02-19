@@ -338,7 +338,9 @@ The `pluginProxyRemoteEntry` plugin handles the actual code generation via its `
 
 ### How `hostInit` works in dev mode
 
-In build mode, `hostInit` is a chunk that imports `remoteEntry.js` and calls `init()`. In dev mode, `pluginProxyRemoteEntry` generates a different script in its `transform` hook:
+In build mode, `hostInit` is a preload hint — it eagerly starts loading `remoteEntry.js` so it's cached by the time `runtimeInitStatus` needs it. Initialization (`remoteEntry.init()`) is triggered by `runtimeInitStatus` itself, not by `hostInit`.
+
+In dev mode, `pluginProxyRemoteEntry` generates a different script in its `transform` hook:
 
 ```js
 const origin = window && true ? window.origin : '//localhost:5173';
@@ -348,7 +350,7 @@ Promise.resolve(remoteEntryPromise).then((remoteEntry) => {
 });
 ```
 
-This dynamically imports the remoteEntry from the dev server's origin and calls `init()`. The `__tla` handling is a compatibility shim for `vite-plugin-top-level-await` — it waits for any TLA promise before calling init, or calls init anyway if there's no TLA.
+In dev mode, `hostInit` still calls `init()` directly because dev mode uses CJS modules with a different initialization path (the `runtimeInitStatus` module uses `module.exports` and is resolved by the dev server's `hostInit` calling `init()`).
 
 The `hostInit` script is injected into the page via one of two methods, controlled by the `hostInitInjectLocation` option:
 
@@ -391,30 +393,33 @@ In dev mode, the var entry is served via middleware that generates the same wrap
 Remote loading and shared dependency resolution are separate systems, but they connect at initialization time:
 
 ```
-                    ┌──────────────────────┐
-                    │   remoteEntry.init()  │
-                    │                      │
-                    │  Registers:          │
-                    │  ├── usedRemotes     │──── where to find other apps
-                    │  └── usedShared      │──── what deps this app provides
-                    │                      │
-                    │  Then:               │
-                    │  initShareScopeMap() │──── negotiates shared dep versions
-                    │  initializeSharing() │     with all connected apps
-                    │                      │
-                    │  Finally:            │
-                    │  initResolve()       │──── unblocks all __loadShare__
-                    │                      │     and __loadRemote__ modules
-                    └──────────────────────┘
+┌─────────────────────────┐        ┌──────────────────────┐
+│  runtimeInitStatus      │        │  remoteEntry.init()   │
+│                         │        │                      │
+│  Self-initializes:      │        │  Registers:          │
+│  import("remoteEntry")  │───────>│  ├── usedRemotes     │──── where to find other apps
+│  .then(entry.init())    │        │  └── usedShared      │──── what deps this app provides
+│                         │        │                      │
+│  Creates initPromise    │        │  Then:               │
+│  on globalThis          │        │  initShareScopeMap() │──── negotiates shared dep versions
+│                         │        │  initializeSharing() │     with all connected apps
+│  hostInit preloads      │        │                      │
+│  remoteEntry for perf   │        │  Finally:            │
+└─────────────────────────┘        │  initResolve()       │──── unblocks all __loadShare__
+                                   │                      │     and __loadRemote__ modules
+                                   └──────────────────────┘
 ```
 
 Both `__loadShare__` and `__loadRemote__` virtual modules await the same `initPromise`. This means:
 
-1. The app's `hostInit` runs and calls `remoteEntry.init()`
-2. `init()` registers both shared deps and remote entries with the runtime
-3. `init()` negotiates shared dep versions
-4. `initResolve()` fires — both shared and remote modules can now load
-5. `loadShare()` calls resolve with the negotiated dependency versions
-6. `loadRemote()` calls resolve by fetching remote entries and calling their `get()` functions
+1. The first proxy module evaluates and imports `runtimeInitStatus`
+2. `runtimeInitStatus` triggers `import("remoteEntry").then(entry => entry.init())` (in build mode)
+3. `init()` registers both shared deps and remote entries with the runtime
+4. `init()` negotiates shared dep versions
+5. `initResolve()` fires — both shared and remote modules can now load
+6. `loadShare()` calls resolve with the negotiated dependency versions
+7. `loadRemote()` calls resolve by fetching remote entries and calling their `get()` functions
 
 The shared negotiation must happen before remote modules load, because remote modules may themselves use shared deps. The `initPromise` ensures this ordering.
+
+Note: `hostInit` is a performance optimization that eagerly starts the `remoteEntry` fetch. By the time `runtimeInitStatus` dynamically imports `remoteEntry`, the fetch is likely already complete or in-flight. But even without `hostInit`, initialization would still work — it would just start later.

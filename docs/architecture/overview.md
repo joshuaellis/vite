@@ -176,8 +176,12 @@ During build, the plugin uses Vite/Rollup's standard chunk emission. The sequenc
    └── Each alias hit writes/updates its virtual module file
 
 3. Module parsing
-   └── pluginModuleParseEnd tracks all modules being parsed
-   └── Waits until parsing completes (or timeout — default 10s)
+   └── pluginModuleParseEnd uses dependency-graph completion detection:
+       each moduleParsed() call registers the module's importedIds and
+       dynamicallyImportedIds as "known", then checks if all known modules
+       have been parsed. No cross-hook race — tracking and completion
+       detection happen in the same hook.
+   └── Waits until the graph is complete (or timeout — default 10s)
    └── This ensures we know ALL shared deps and remotes actually used
 
 4. Code generation
@@ -265,18 +269,23 @@ When the app loads in the browser, this happens:
 ```
 1. Browser loads index.html
 2. hostInit script runs (injected by pluginAddEntry)
-3. hostInit imports remoteEntry.js
-4. remoteEntry.init() is called:
-   a. Calls @module-federation/runtime init()
-   b. Registers shared modules (with version, singleton config)
-   c. Registers remote entries (URLs of other apps)
-   d. Initializes shared scope (negotiates versions with any already-loaded remotes)
-   e. Resolves initPromise — all __loadShare__ and __loadRemote__ modules can now proceed
-5. App code runs, import('remote/Module') resolves through loadRemote()
-6. Shared deps resolve through loadShare() — runtime picks the best available version
+   └── Eagerly starts loading remoteEntry.js (preload hint for performance)
+3. App code runs, first __loadShare__ or __loadRemote__ import evaluates
+4. runtimeInitStatus module evaluates (imported by the proxy module):
+   a. Creates initPromise on globalThis
+   b. Triggers dynamic import("remoteEntry") — may already be cached from hostInit preload
+   c. remoteEntry.init() is called:
+      - Calls @module-federation/runtime init()
+      - Registers shared modules (with version, singleton config)
+      - Registers remote entries (URLs of other apps)
+      - Initializes shared scope (negotiates versions with any already-loaded remotes)
+      - Resolves initPromise — all __loadShare__ and __loadRemote__ modules can now proceed
+5. Remaining proxy modules resolve through loadRemote() and loadShare()
 ```
 
 The `initPromise` is the synchronization point. All proxied imports (both shared and remote) await this promise before calling into the runtime. This guarantees the federation runtime is ready before any federated module is loaded.
+
+Initialization is **self-contained** — `runtimeInitStatus` triggers `remoteEntry.init()` itself via dynamic import. `hostInit` is purely a performance optimization that starts the remoteEntry fetch early (so it's likely cached by the time `runtimeInitStatus` requests it). This eliminates the fragile ordering dependency where `hostInit` had to evaluate before any TLA module.
 
 This sequence is the same whether the app is a host, a remote, or both. The distinction between host and remote is purely about config — `exposes` vs `remotes` — not about the initialization codepath. An app that is both a host and a remote runs this sequence once, and its `remoteEntry.init()` both registers its own shared deps and sets up its remote connections.
 
@@ -284,7 +293,9 @@ This sequence is the same whether the app is a host, a remote, or both. The dist
 
 ### Module parse timeout (build only)
 
-During build, the plugin waits for all modules to be parsed before generating `remoteEntry.js` (so it knows which shared deps are actually used). If parsing takes longer than the timeout (default: 10 seconds, configurable via `moduleParseTimeout`), the plugin logs a warning and force-resolves:
+During build, the plugin waits for all modules to be parsed before generating `remoteEntry.js` (so it knows which shared deps are actually used). Completion is detected using a dependency-graph approach: each `moduleParsed()` call registers the module AND its declared dependencies (`importedIds` + `dynamicallyImportedIds`) as "known", then checks if all known modules have finished parsing. Because both tracking and checking happen in the same hook call, the check cannot match prematurely — child modules are always registered before the size comparison runs.
+
+If the graph never completes (e.g., a module silently fails to parse) and the timeout expires (default: 10 seconds, configurable via `moduleParseTimeout`), the plugin logs a warning and force-resolves:
 
 ```
 Parse timeout (10s) - forcing resolve

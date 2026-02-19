@@ -74,7 +74,7 @@ The key differences between the three:
 | Invocation     | `fileName`             | `inject`              | Purpose                                            |
 | -------------- | ---------------------- | --------------------- | -------------------------------------------------- |
 | remoteEntry    | `'remoteEntry-[hash]'` | `'entry'` (default)   | Emit as a named chunk with a specific filename     |
-| hostInit       | `undefined`            | `'html'` or `'entry'` | Inject into page so it runs before app code        |
+| hostInit       | `undefined`            | `'html'` or `'entry'` | Eagerly preload remoteEntry for performance        |
 | virtualExposes | `undefined`            | `'entry'` (default)   | Include in the bundle graph (no special injection) |
 
 The `fileName` and `inject` options completely change how `addEntry` behaves. `fileName` controls whether the chunk gets a specific output name (and whether the dev middleware creates a redirect). `inject` controls whether the script gets wired into HTML or into JS entry files.
@@ -364,15 +364,14 @@ Here's the complete picture for each invocation, in both modes:
 │  Build: Emits hostInit-xyz789.js as an anonymous chunk                        │
 │         <script type="module" src="/hostInit-xyz789.js"> injected into <head> │
 │                                                                               │
-│  Result: Runs before any app code, imports remoteEntry, calls init()          │
+│  Result: Eagerly starts loading remoteEntry (preload hint for performance).   │
+│          Initialization is handled by runtimeInitStatus, not hostInit.        │
 │                                                                               │
 │  Generated hostInit file contents:                                            │
-│    const remoteEntryPromise = import("virtual:mf-REMOTE_ENTRY_ID")            │
-│    Promise.resolve(remoteEntryPromise)                                        │
-│      .then(remoteEntry => {                                                   │
-│        return Promise.resolve(remoteEntry.__tla)                              │
-│          .then(remoteEntry.init).catch(remoteEntry.init)                      │
-│      })                                                                       │
+│    // Eagerly start loading remoteEntry for performance.                      │
+│    // Initialization is handled by runtimeInitStatus — this is just a         │
+│    // preload hint.                                                           │
+│    import("virtual:mf-REMOTE_ENTRY_ID");                                      │
 └───────────────────────────────────────────────────────────────────────────────┘
 
 ┌─ virtualExposes (fileName: none, inject: 'entry') ───────────────────────────┐
@@ -419,16 +418,20 @@ Here's the complete picture for each invocation, in both modes:
 1. Browser requests index.html
 2. HTML contains <script type="module" src="hostInit-xyz789.js"> in <head>
 3. Browser fetches and executes hostInit
-4. hostInit imports remoteEntry.js (build) or fetches it from dev server (dev)
-5. remoteEntry.init() runs:
-   ├── Registers shared deps and remotes with the runtime
-   ├── Negotiates shared dep versions
-   └── Resolves initPromise
-6. App's entry JS file loads (may have import of remoteEntry/virtualExposes prepended)
-7. Any import('remote/Module') or import of a shared dep resolves through the
-   now-initialized runtime
+4. hostInit starts loading remoteEntry.js (preload — no init() call)
+5. App's entry JS file loads (may have import of remoteEntry/virtualExposes prepended)
+6. First __loadShare__ or __loadRemote__ proxy module evaluates:
+   └── Imports runtimeInitStatus, which triggers:
+       a. Dynamic import("remoteEntry") — likely already cached from hostInit preload
+       b. remoteEntry.init() runs:
+          ├── Registers shared deps and remotes with the runtime
+          ├── Negotiates shared dep versions
+          └── Resolves initPromise
+7. Remaining proxy modules resolve through loadRemote() and loadShare()
 ```
 
-The key ordering guarantee: because `hostInit` is injected into `<head>` as a separate `<script>` tag (in `'html'` mode), it starts loading before the app's bundled JS. By the time the app code runs and hits a `__loadShare__` or `__loadRemote__` import, `initPromise` has already resolved (or is about to). This is why `'html'` is the default for `hostInitInjectLocation` — it provides the earliest possible initialization.
+The key ordering guarantee is enforced by the **dependency graph**, not by evaluation order. Every `__loadShare__` and `__loadRemote__` module statically imports `runtimeInitStatus`, which self-initializes by dynamically importing `remoteEntry`. This means initialization is triggered on-demand by the first proxy module that evaluates — regardless of when `hostInit` runs.
 
-With `inject: 'entry'`, the init import is at the top of the entry file, so it runs first within that file's execution, but the file itself may load later than a dedicated `<script>` tag would.
+`hostInit` is a **performance optimization**: because it's injected into `<head>` as a separate `<script>` tag (in `'html'` mode), it starts the `remoteEntry` fetch early. By the time `runtimeInitStatus` dynamically imports `remoteEntry`, the fetch is likely already complete or in-flight. This is why `'html'` is the default for `hostInitInjectLocation` — it provides the earliest possible preload.
+
+With `inject: 'entry'`, the preload import is at the top of the entry file, so it starts slightly later but still before most app code runs.
